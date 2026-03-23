@@ -9,7 +9,9 @@ const cors = require('cors');
 const helmet = require('helmet');
 const fs = require('fs');
 const https = require('https');
+const moment = require('moment');
 const TokenHelper = require('./helpers/token.helper');
+const PassHelper = require('./helpers/pass.helper');
 
 // Declaraciones
 const port = config.PORT;
@@ -43,17 +45,15 @@ var auth = (req, res, next) => {
         return;
     };
 
-    // Recogemos el token de la cabecera "Authorization: Bearer <token>"
     const queToken = req.headers.authorization.split(' ')[1];
 
-    // Verificamos que el token sea correcto y no haya caducado
     TokenHelper.decodificaToken(queToken).then(
         userID => {
             req.user = {
                 token: queToken,
                 id: userID
             };
-            return next(); // Pasamos el testigo al controlador de la ruta
+            return next();
         },
         err => {
             res.status(401);
@@ -72,7 +72,7 @@ app.use(allowCrossTokenOrigin);
 app.use(allowCrossTokenMethods);
 app.use(allowCrossTokenHeaders);
 
-// rutas
+// routes /api/user
 app.get('/api/user', auth, (req, res, next) => {
     db.user.find((err, coleccion) => {
         if (err) return res.status(500).json({ result: 'KO', msg: err });
@@ -90,7 +90,6 @@ app.get('/api/user/:id', auth, (req, res, next) => {
 
 app.post('/api/user', auth, (req, res, next) => {
     const nuevoElemento = req.body;
-
     db.user.save(nuevoElemento, (err, coleccionGuardada) => {
         if (err) return res.status(500).json({ result: 'KO', msg: err });
         res.json(coleccionGuardada);
@@ -100,7 +99,6 @@ app.post('/api/user', auth, (req, res, next) => {
 app.put('/api/user/:id', auth, (req, res, next) => {
     const elementoId = req.params.id;
     const nuevosRegistros = req.body;
-
     db.user.update(
         { _id: id(elementoId) },
         { $set: nuevosRegistros },
@@ -113,10 +111,83 @@ app.put('/api/user/:id', auth, (req, res, next) => {
 
 app.delete('/api/user/:id', auth, (req, res, next) => {
     const elementoId = req.params.id;
-
     db.user.remove({ _id: id(elementoId) }, (err, resultado) => {
         if (err) return res.status(500).json({ result: 'KO', msg: err });
         res.json(resultado);
+    });
+});
+
+// routes /api/auth
+app.get('/api/auth', auth, (req, res, next) => {
+    db.user.find({}, { _id: 0, displayName: 1, email: 1 }, (err, usuarios) => {
+        if (err) return res.status(500).json({ result: 'KO', msg: err });
+        res.json({ result: 'OK', usuarios: usuarios });
+    });
+});
+
+app.get('/api/auth/me', auth, (req, res, next) => {
+    db.user.findOne({ _id: id(req.user.id) }, (err, usuario) => {
+        if (err) return res.status(500).json({ result: 'KO', msg: err });
+        if (!usuario) return res.status(404).json({ result: 'KO', msg: 'Usuario no encontrado' });
+        res.json({ result: 'OK', usuario: usuario });
+    });
+});
+
+app.post('/api/auth/reg', (req, res, next) => {
+    const { name, email, pass } = req.body;
+
+    if (!name) return res.status(400).json({ result: 'KO', msg: 'El nombre es obligatorio' });
+    if (!email) return res.status(400).json({ result: 'KO', msg: 'El email es obligatorio' });
+    if (!pass) return res.status(400).json({ result: 'KO', msg: 'La contraseña es obligatoria' });
+
+    db.user.findOne({ email: email }, (err, usuarioExistente) => {
+        if (err) return res.status(500).json({ result: 'KO', msg: err });
+        if (usuarioExistente) return res.status(400).json({ result: 'KO', msg: 'Ya existe un usuario con ese email' });
+
+        PassHelper.encriptaPassword(pass).then(hash => {
+            const ahora = moment().unix();
+            const nuevoUsuario = {
+                displayName: name,
+                email: email,
+                password: hash,
+                signupDate: ahora,
+                lastLogin: ahora
+            };
+
+            db.user.save(nuevoUsuario, (err, usuarioGuardado) => {
+                if (err) return res.status(500).json({ result: 'KO', msg: err });
+                const token = TokenHelper.creaToken(usuarioGuardado);
+                res.json({ result: 'OK', token: token, usuario: usuarioGuardado });
+            });
+        }).catch(err => res.status(500).json({ result: 'KO', msg: err }));
+    });
+});
+
+app.post('/api/auth/login', (req, res, next) => {
+    const { email, pass } = req.body;
+
+    if (!email || !pass) return res.status(400).json({ result: 'KO', msg: 'Debe suministrar un correo y una contraseña' });
+
+    db.user.findOne({ email: email }, (err, usuario) => {
+        if (err) return res.status(500).json({ result: 'KO', msg: err });
+        if (!usuario) return res.status(401).json({ result: 'KO', msg: 'El usuario no está registrado o la contraseña no es correcta' });
+
+        PassHelper.comparaPassword(pass, usuario.password).then(passOK => {
+            if (!passOK) return res.status(401).json({ result: 'KO', msg: 'El usuario no está registrado o la contraseña no es correcta' });
+
+            const ahora = moment().unix();
+            db.user.update(
+                { _id: usuario._id },
+                { $set: { lastLogin: ahora } },
+                { safe: true, multi: false },
+                (err, result) => {
+                    if (err) return res.status(500).json({ result: 'KO', msg: err });
+                    usuario.lastLogin = ahora;
+                    const token = TokenHelper.creaToken(usuario);
+                    res.json({ result: 'OK', token: token, usuario: usuario });
+                }
+            );
+        }).catch(err => res.status(500).json({ result: 'KO', msg: err }));
     });
 });
 
