@@ -9,9 +9,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const fs = require('fs');
 const https = require('https');
-const moment = require('moment');
-const TokenHelper = require('./helpers/token.helper');
-const PassHelper = require('./helpers/pass.helper');
+const AuthMiddleware = require('./middlewares/auth.middleware');
 
 // Declaraciones
 const port = config.PORT;
@@ -38,30 +36,6 @@ var allowCrossTokenHeaders = (req, res, next) => {
     return next();
 };
 
-// middleware de autenticación
-var auth = (req, res, next) => {
-    if (!req.headers.authorization) {
-        res.status(401).json({ result: 'KO', msg: "Envía un token válido en la cabecera 'Authorization'" });
-        return;
-    };
-
-    const queToken = req.headers.authorization.split(' ')[1];
-
-    TokenHelper.decodificaToken(queToken).then(
-        userID => {
-            req.user = {
-                token: queToken,
-                id: userID
-            };
-            return next();
-        },
-        err => {
-            res.status(401);
-            res.json({ result: 'KO', msg: `No autorizado: ${err.msg}` });
-        }
-    );
-};
-
 // Middlewares
 app.use(helmet());
 app.use(logger('dev'));
@@ -72,34 +46,49 @@ app.use(allowCrossTokenOrigin);
 app.use(allowCrossTokenMethods);
 app.use(allowCrossTokenHeaders);
 
-// routes /api/user
-app.get('/api/user', auth, (req, res, next) => {
-    db.user.find((err, coleccion) => {
+// añadimos un trigger previo a las rutas
+app.param("coleccion", (req, res, next, coleccion) => {
+    req.collection = db.collection(coleccion);
+    return next();
+});
+
+// routes
+app.get('/api', AuthMiddleware.auth, (req, res, next) => {
+    db.getCollectionNames((err, colecciones) => {
+        if (err) return res.status(500).json({ result: 'KO', msg: err });
+        res.json(colecciones);
+    });
+});
+
+app.get('/api/:coleccion', AuthMiddleware.auth, (req, res, next) => {
+    req.collection.find((err, coleccion) => {
         if (err) return res.status(500).json({ result: 'KO', msg: err });
         res.json(coleccion);
     });
 });
 
-app.get('/api/user/:id', auth, (req, res, next) => {
+app.get('/api/:coleccion/:id', AuthMiddleware.auth, (req, res, next) => {
     const elementoId = req.params.id;
-    db.user.findOne({ _id: id(elementoId) }, (err, elementoRecuperado) => {
+    req.collection.findOne({ _id: id(elementoId) }, (err, elementoRecuperado) => {
         if (err) return res.status(500).json({ result: 'KO', msg: err });
         res.json(elementoRecuperado);
     });
 });
 
-app.post('/api/user', auth, (req, res, next) => {
+app.post('/api/:coleccion', AuthMiddleware.auth, (req, res, next) => {
     const nuevoElemento = req.body;
-    db.user.save(nuevoElemento, (err, coleccionGuardada) => {
+
+    req.collection.save(nuevoElemento, (err, coleccionGuardada) => {
         if (err) return res.status(500).json({ result: 'KO', msg: err });
         res.json(coleccionGuardada);
     });
 });
 
-app.put('/api/user/:id', auth, (req, res, next) => {
+app.put('/api/:coleccion/:id', AuthMiddleware.auth, (req, res, next) => {
     const elementoId = req.params.id;
     const nuevosRegistros = req.body;
-    db.user.update(
+
+    req.collection.update(
         { _id: id(elementoId) },
         { $set: nuevosRegistros },
         { safe: true, multi: false },
@@ -109,85 +98,12 @@ app.put('/api/user/:id', auth, (req, res, next) => {
         });
 });
 
-app.delete('/api/user/:id', auth, (req, res, next) => {
+app.delete('/api/:coleccion/:id', AuthMiddleware.auth, (req, res, next) => {
     const elementoId = req.params.id;
-    db.user.remove({ _id: id(elementoId) }, (err, resultado) => {
+
+    req.collection.remove({ _id: id(elementoId) }, (err, resultado) => {
         if (err) return res.status(500).json({ result: 'KO', msg: err });
         res.json(resultado);
-    });
-});
-
-// routes /api/auth
-app.get('/api/auth', auth, (req, res, next) => {
-    db.user.find({}, { _id: 0, displayName: 1, email: 1 }, (err, usuarios) => {
-        if (err) return res.status(500).json({ result: 'KO', msg: err });
-        res.json({ result: 'OK', usuarios: usuarios });
-    });
-});
-
-app.get('/api/auth/me', auth, (req, res, next) => {
-    db.user.findOne({ _id: id(req.user.id) }, (err, usuario) => {
-        if (err) return res.status(500).json({ result: 'KO', msg: err });
-        if (!usuario) return res.status(404).json({ result: 'KO', msg: 'Usuario no encontrado' });
-        res.json({ result: 'OK', usuario: usuario });
-    });
-});
-
-app.post('/api/auth/reg', (req, res, next) => {
-    const { name, email, pass } = req.body;
-
-    if (!name) return res.status(400).json({ result: 'KO', msg: 'El nombre es obligatorio' });
-    if (!email) return res.status(400).json({ result: 'KO', msg: 'El email es obligatorio' });
-    if (!pass) return res.status(400).json({ result: 'KO', msg: 'La contraseña es obligatoria' });
-
-    db.user.findOne({ email: email }, (err, usuarioExistente) => {
-        if (err) return res.status(500).json({ result: 'KO', msg: err });
-        if (usuarioExistente) return res.status(400).json({ result: 'KO', msg: 'Ya existe un usuario con ese email' });
-
-        PassHelper.encriptaPassword(pass).then(hash => {
-            const ahora = moment().unix();
-            const nuevoUsuario = {
-                displayName: name,
-                email: email,
-                password: hash,
-                signupDate: ahora,
-                lastLogin: ahora
-            };
-
-            db.user.save(nuevoUsuario, (err, usuarioGuardado) => {
-                if (err) return res.status(500).json({ result: 'KO', msg: err });
-                const token = TokenHelper.creaToken(usuarioGuardado);
-                res.json({ result: 'OK', token: token, usuario: usuarioGuardado });
-            });
-        }).catch(err => res.status(500).json({ result: 'KO', msg: err }));
-    });
-});
-
-app.post('/api/auth/login', (req, res, next) => {
-    const { email, pass } = req.body;
-
-    if (!email || !pass) return res.status(400).json({ result: 'KO', msg: 'Debe suministrar un correo y una contraseña' });
-
-    db.user.findOne({ email: email }, (err, usuario) => {
-        if (err) return res.status(500).json({ result: 'KO', msg: err });
-        if (!usuario) return res.status(401).json({ result: 'KO', msg: 'El usuario no está registrado o la contraseña no es correcta' });
-
-        PassHelper.comparaPassword(pass, usuario.password).then(passOK => {
-            if (!passOK) return res.status(401).json({ result: 'KO', msg: 'El usuario no está registrado o la contraseña no es correcta' });
-
-            const ahora = moment().unix();
-            db.user.update(
-                { _id: usuario._id },
-                { $set: { lastLogin: ahora } },
-                { safe: true, multi: false },
-                (err, result) => {
-                    if (err) return res.status(500).json({ result: 'KO', msg: err });
-                    usuario.lastLogin = ahora;
-                    const token = TokenHelper.creaToken(usuario);
-                    res.json({ result: 'OK', token: token, usuario: usuario });
-                }
-            );
-        }).catch(err => res.status(500).json({ result: 'KO', msg: err }));
     });
 });
 
@@ -196,5 +112,5 @@ https.createServer({
     cert: fs.readFileSync('./cert/cert.pem'),
     key: fs.readFileSync('./cert/key.pem')
 }, app).listen(port, () => {
-    console.log(`API AUTH ejecutándose en https://localhost:${port}/api/{user|auth}/{id}`);
+    console.log(`API RESTful CRUD ejecutándose en https://localhost:${port}/api/{colecciones}/{id}`);
 });
